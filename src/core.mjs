@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile, rename, open, unlink } from 'node:fs/promis
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-const url = (process.env.OPENCODE_URL || 'http://127.0.0.1:4096').replace(/\/$/, '');
+const url = (process.env.OPENCODE_URL || process.env.OPENCODE_HOST || 'http://127.0.0.1:4096').replace(/\/$/, '');
 const store = resolve(process.env.ORCHESTRATOR_STORE || new URL('../.state/tasks.json', import.meta.url).pathname);
 const timeout = Number(process.env.OPENCODE_TIMEOUT_MS || 12000);
 const sleep = ms => new Promise(r => setTimeout(r,ms));
@@ -30,16 +30,19 @@ async function request(method,path,body) {
     return value?.data ?? value;
   } finally { clearTimeout(timer); }
 }
-async function withStore(fn) {
+async function withLock(lock,fn) {
   await mkdir(dirname(store), {recursive:true});
-  const lock = store+'.lock';
   let handle;
-  for(let i=0;i<100;i++){
+  for(let i=0;i<Math.ceil(timeout/40)+100;i++){
     try { handle=await open(lock,'wx');break; }
     catch(e){ if(e.code!=='EEXIST')throw e;await sleep(40); }
   }
   if(!handle)throw Error('Store locked; inspect stale .lock before removing it');
-  try {
+  try {return await fn();}
+  finally {await handle.close();await unlink(lock);}
+}
+async function withStore(fn) {
+  return withLock(store+'.lock',async()=>{
     let tasks=[];
     try {tasks=JSON.parse(await readFile(store,'utf8'));} catch(e){if(e.code!=='ENOENT')throw e;}
     const result=await fn(tasks);
@@ -47,7 +50,7 @@ async function withStore(fn) {
     await writeFile(tmp,JSON.stringify(tasks,null,2)+'\n',{mode:0o600});
     await rename(tmp,store);
     return result;
-  } finally {await handle.close();await unlink(lock).catch(()=>{});}
+  });
 }
 async function readTasks() {try{return JSON.parse(await readFile(store,'utf8'));}catch(e){if(e.code==='ENOENT')return [];throw e;}}
 function find(tasks,id){const task=tasks.find(t=>t.id===id);if(!task)throw Error('Unknown task: '+id);return task;}
@@ -60,12 +63,11 @@ export async function createTask({title,prompt:text,directory,agent}={}) {
   const dir=resolve(directory||process.env.ORCHESTRATOR_WORKER_DIR||process.cwd());
   const id=taskId();
   // V2 sessions are created at a location; no legacy /session fallback.
-  const session=await request('POST','/api/session',{title:'['+id+'] '+title,directory:dir});
+  const session=await request('POST','/api/session',{title:'['+id+'] '+title,location:{directory:dir},...(agent?{agent}:{})});
   if(!session?.id)throw Error('V2 create did not return session id');
   const task={id,title,prompt:text,directory:dir,agent:agent||null,sessionId:session.id,status:'dispatching',createdAt:now(),updatedAt:now(),updates:[],error:null};
   await withStore(tasks=>{tasks.push(task);});
   try {
-    if(agent)await request('POST',sessionPath(session.id)+'/agent',{agent});
     await prompt(session.id,text,'steer');
     await update(id,{status:'running'});
     return {id,sessionId:session.id,directory:dir,status:'running',delivery:'steer'};
@@ -78,6 +80,8 @@ export async function sendTask({id,instruction,delivery='steer'}={}) {
   if(!instruction?.trim())throw Error('instruction required');
   if(!['steer','queue'].includes(delivery))throw Error('delivery must be steer or queue');
   const task=find(await readTasks(),id);
+  return withLock(store+'.'+task.id+'.lock',async()=>{
+  const task=find(await readTasks(),id);
   if(['cancelled','dispatch_failed'].includes(task.status))throw Error('Task is '+task.status);
   const entry={id:randomUUID(),text:instruction,delivery,status:'submitting',createdAt:now()};
   await withStore(tasks=>{find(tasks,id).updates.push(entry);});
@@ -89,6 +93,7 @@ export async function sendTask({id,instruction,delivery='steer'}={}) {
     await withStore(tasks=>{const t=find(tasks,id);t.updates.find(x=>x.id===entry.id).status='uncertain';t.error=String(e);t.updatedAt=now();});
     throw Error('Steering admission uncertain; inspect session before retrying: '+e.message);
   }
+  });
 }
 export async function listTasks({refresh=false}={}) {
   const tasks=await readTasks();
@@ -96,11 +101,22 @@ export async function listTasks({refresh=false}={}) {
   let active=null,error=null;
   try {active=await request('GET','/api/session/active');}
   catch(e){error=String(e);}
-  return tasks.map(t=>({...t,liveActive:active===null?null:Boolean(active?.[t.sessionId]),liveError:error,statusNote:'Active is not equivalent to task completion.'}));
+  return Promise.all(tasks.map(async t=>{
+    const result={...t,liveActive:active===null?null:Boolean(active[t.sessionId]),liveError:error,statusNote:'Active and succeeded do not prove task acceptance. Inactive unfinished work requires inspection; never automatically resubmitted.'};
+    if(active===null)return result;
+    if(result.liveActive)return {...result,executionStatus:'running'};
+    try {
+      const session=await request('GET',sessionPath(t.sessionId));
+      const pending=await request('GET',sessionPath(t.sessionId)+'/inbox');
+      return {...result,executionStatus:pending.length?'pending_recovery':session.outcome||'inactive_unresolved',pendingInputs:pending.length};
+    } catch(e){return {...result,executionStatus:'unavailable',liveError:String(e)};}
+  }));
 }
 export async function cancelTask({id}={}) {
   const task=find(await readTasks(),id);
-  const response=await request('POST',sessionPath(task.sessionId)+'/interrupt',undefined);
+  return withLock(store+'.'+task.id+'.lock',async()=>{
+  const response=await request('POST',sessionPath(task.sessionId)+'/interrupt?resume=false',undefined);
   await update(id,{status:'cancelled'});
   return {id,status:'cancelled',interrupted:response?.interrupted??null,note:'Interrupt requested; confirm no external side effects remain.'};
+  });
 }

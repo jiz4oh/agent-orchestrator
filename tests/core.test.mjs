@@ -8,6 +8,7 @@ const directory=await mkdtemp(join(tmpdir(),'orchestrator-'));
 process.env.ORCHESTRATOR_STORE=join(directory,'tasks.json');
 const received=[];
 let seq=0;
+let holdInterrupt;
 const server=createServer(async(req,res)=>{
   let body='';
   for await(const chunk of req)body+=chunk;
@@ -17,7 +18,12 @@ const server=createServer(async(req,res)=>{
   if(req.url==='/api/session' && req.method==='POST')return res.end(JSON.stringify({data:{id:'ses_'+(++seq)}}));
   if(req.url?.endsWith('/prompt'))return res.end(JSON.stringify({data:{id:'msg_'+seq}}));
   if(req.url==='/api/session/active')return res.end(JSON.stringify({data:{'ses_1':{}}}));
-  if(req.url?.endsWith('/interrupt'))return res.end(JSON.stringify({data:{interrupted:true}}));
+  if(req.url?.endsWith('/inbox'))return res.end(JSON.stringify({data:[]}));
+  if(req.method==='GET' && req.url?.startsWith('/api/session/'))return res.end(JSON.stringify({data:{outcome:'succeeded'}}));
+  if(req.url?.endsWith('/interrupt?resume=false')){
+    if(holdInterrupt)await holdInterrupt();
+    return res.end(JSON.stringify({interrupted:true}));
+  }
   res.statusCode=404;res.end('{}');
 });
 await new Promise(r=>server.listen(0,'127.0.0.1',r));
@@ -26,6 +32,7 @@ const {createTask,sendTask,listTasks,cancelTask}=await import('../src/core.mjs')
 test('creates background worker then live-steers busy worker with V2 admission',async()=>{
   const t=await createTask({title:'code',prompt:'implement',directory});
   assert.equal(t.status,'running');
+  assert.deepEqual(received[0].input,{title:'['+t.id+'] code',location:{directory}});
   const steering=await sendTask({id:t.id,instruction:'add tests'});
   assert.equal(steering.status,'admitted');
   assert.equal(steering.delivery,'steer');
@@ -44,5 +51,31 @@ test('creates background worker then live-steers busy worker with V2 admission',
 test('rejects invalid steering mode',async()=>{
   const list=await listTasks();
   await assert.rejects(()=>sendTask({id:list[0].id,instruction:'oops',delivery:'broken'}),/delivery must/);
+});
+test('parallel writes preserve task mappings and recovery inspection does not dispatch',async()=>{
+  const created=await Promise.all(Array.from({length:8},(_,i)=>createTask({title:'parallel '+i,prompt:'work',directory})));
+  const before=received.filter(x=>x.url.endsWith('/prompt')).length;
+  const tasks=await listTasks({refresh:true});
+  assert.equal(tasks.length,9);
+  assert.equal(new Set(tasks.map(t=>t.id)).size,9);
+  for(const t of created)assert.ok(tasks.some(x=>x.id===t.id && x.sessionId===t.sessionId));
+  assert.equal(tasks[0].executionStatus,'running');
+  assert.ok(tasks.slice(1).every(t=>t.executionStatus==='succeeded'));
+  assert.equal(received.filter(x=>x.url.endsWith('/prompt')).length,before);
+});
+test('a send waiting on cancellation cannot resume the cancelled worker',async()=>{
+  const task=await createTask({title:'cancel race',prompt:'work',directory});
+  let reached,release;
+  const entered=new Promise(r=>{reached=r;});
+  const barrier=new Promise(r=>{release=r;});
+  holdInterrupt=async()=>{reached();await barrier;};
+  const cancellation=cancelTask({id:task.id});
+  await entered;
+  const before=received.filter(x=>x.url.endsWith('/prompt')).length;
+  const sending=assert.rejects(()=>sendTask({id:task.id,instruction:'must not restart'}),/Task is cancelled/);
+  release();
+  await Promise.all([cancellation,sending]);
+  holdInterrupt=undefined;
+  assert.equal(received.filter(x=>x.url.endsWith('/prompt')).length,before);
 });
 test.after(async()=>{await new Promise(r=>server.close(r));await rm(directory,{recursive:true,force:true});});
