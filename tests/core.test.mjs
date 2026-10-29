@@ -1,0 +1,48 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+const directory=await mkdtemp(join(tmpdir(),'orchestrator-'));
+process.env.ORCHESTRATOR_STORE=join(directory,'tasks.json');
+const received=[];
+let seq=0;
+const server=createServer(async(req,res)=>{
+  let body='';
+  for await(const chunk of req)body+=chunk;
+  const input=body?JSON.parse(body):null;
+  received.push({url:req.url,method:req.method,input});
+  res.setHeader('content-type','application/json');
+  if(req.url==='/api/session' && req.method==='POST')return res.end(JSON.stringify({data:{id:'ses_'+(++seq)}}));
+  if(req.url?.endsWith('/prompt'))return res.end(JSON.stringify({data:{id:'msg_'+seq}}));
+  if(req.url==='/api/session/active')return res.end(JSON.stringify({data:{'ses_1':{}}}));
+  if(req.url?.endsWith('/interrupt'))return res.end(JSON.stringify({data:{interrupted:true}}));
+  res.statusCode=404;res.end('{}');
+});
+await new Promise(r=>server.listen(0,'127.0.0.1',r));
+process.env.OPENCODE_URL='http://127.0.0.1:'+server.address().port;
+const {createTask,sendTask,listTasks,cancelTask}=await import('../src/core.mjs');
+test('creates background worker then live-steers busy worker with V2 admission',async()=>{
+  const t=await createTask({title:'code',prompt:'implement',directory});
+  assert.equal(t.status,'running');
+  const steering=await sendTask({id:t.id,instruction:'add tests'});
+  assert.equal(steering.status,'admitted');
+  assert.equal(steering.delivery,'steer');
+  const prompts=received.filter(x=>x.url.endsWith('/prompt'));
+  assert.deepEqual(prompts.map(x=>x.input.delivery),['steer','steer']);
+  assert.equal(prompts[1].input.text,'add tests');
+  assert.ok(!received.some(x=>x.url.includes('prompt_async')));
+  const list=await listTasks({refresh:true});
+  assert.equal(list[0].updates[0].status,'admitted');
+  assert.equal(list[0].liveActive,true);
+  await sendTask({id:t.id,instruction:'next task',delivery:'queue'});
+  assert.equal(received.filter(x=>x.url.endsWith('/prompt'))[2].input.delivery,'queue');
+  const stop=await cancelTask({id:t.id});
+  assert.equal(stop.interrupted,true);
+});
+test('rejects invalid steering mode',async()=>{
+  const list=await listTasks();
+  await assert.rejects(()=>sendTask({id:list[0].id,instruction:'oops',delivery:'broken'}),/delivery must/);
+});
+test.after(async()=>{await new Promise(r=>server.close(r));await rm(directory,{recursive:true,force:true});});
